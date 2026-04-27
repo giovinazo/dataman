@@ -1,0 +1,21 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# 백업 폴더
+_backup_*/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# 추출 결과 (테스트 산출물)
+dataman_*.json
+dataman_*.jsonl
+dataman_partial_*.json
+추출로그_*.txt
+
+# 설정 파일
+.audit_tools.json

@@ -1,0 +1,9 @@
+# DataMan 필수 패키지
+olefile
+PyMuPDF
+
+# 선택 패키지 (필요시 주석 해제)
+python-docx
+pywin32
+pytesseract
+Pillow
