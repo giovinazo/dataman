@@ -1,0 +1,20 @@
+[project]
+name = "dataman-mcp"
+version = "0.1.0"
+description = "DataMan MCP server: 한국어 문서(HWP/HWPX/PDF/DOC/DOCX/TXT) 텍스트·표 추출 도구"
+requires-python = ">=3.10"
+authors = [{ name = "허재영" }]
+
+dependencies = [
+    "mcp>=1.0.0",
+    "PyMuPDF",
+    "olefile",
+    "python-docx",
+    "defusedxml",
+]
+
+[project.optional-dependencies]
+ocr = ["pytesseract", "Pillow"]
+
+[project.scripts]
+dataman-mcp = "mcp_server.server:main"
