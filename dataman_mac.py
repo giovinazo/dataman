@@ -1,17 +1,20 @@
 # -*- coding: utf-8 -*-
 # ──────────────────────────────────────────────────
 # 프로그램명: DataMan for Mac (데이터맨 - 문서 텍스트 추출 도구 macOS 버전)
-# 버전: 1.1-mac
+# 버전: 1.2-mac
 # 저작자: 허재영
 # 창작연도: 2025
-# 최종 수정일: 2026-04-27
+# 최종 수정일: 2026-09-23
 # Copyright (c) 2025-2026 허재영. All rights reserved.
 # v1.1 변경: HWPX 표 마크다운 보존 / JSONL 스트리밍 출력 / 중단 시 부분 결과 저장
+# v1.2 변경: PDF 쪽 단위 OCR 판정(스캔·깨진 글자층·글자층 부실) / macOS Vision 기본 엔진
+#            (Tesseract 예비) / 작은 이미지 확대 인식 / 이미지·엑셀·hwx·zip 지원 /
+#            경로 NFC·본문해시·쪽별 추출 방식 기록 / 실행 후 점검표 자동 출력
 # ──────────────────────────────────────────────────
 """
 DataMan for Mac - 문서 텍스트 추출 도구 (macOS)
 ====================================================================
-HWP/HWPX/PDF/TXT/DOC/DOCX -> JSON 통합 전처리 스크립트
+HWP/HWPX/HWX/PDF/TXT/DOC/DOCX/XLSX/XLS/JPG/PNG/ZIP -> JSON 통합 전처리 스크립트
 
 실행:
   python dataman_mac.py                          (폴더 선택 대화상자)
@@ -22,16 +25,28 @@ HWP/HWPX/PDF/TXT/DOC/DOCX -> JSON 통합 전처리 스크립트
   2. 추출이 어려운 파일은 에러 처리 후 다음 파일로 넘어간다.
   3. CLI 실행 시 매 파일마다 진행상황을 보고한다.
   4. 추출 결과는 JSON 1개 파일로 저장한다.
-  5. 추출 완료 후 "추출로그.txt" 파일을 생성한다.
+  5. 추출 완료 후 "추출로그.txt"와 "점검표.md" 파일을 생성한다.
+
+PDF 쪽 단위 OCR 판정 (v1.2):
+  - 스캔 쪽: 글자층 50자 미만 + 이미지 있음 → OCR 결과로 교체
+  - 깨진 글자층: garbled() 판정 → OCR 결과로 교체
+  - 글자층 부실: 50자 미만(도형 글자 등) 또는 큰 이미지(30% 이상) 위 한글 100자 미만
+    → OCR 한글이 글자층의 1.1배+5자를 넘을 때만 교체
+  - 작은 이미지 쪽(이미지가 쪽 면적 70% 미만): 이미지 상자를 잘라 확대 인식,
+    한글이 기존의 1.1배+5자를 넘을 때만 채택 (Vision 전용)
+  - 절반 이상 OCR한 문서: 나머지 쪽도 OCR 한글이 1.1배+5자를 넘으면 교체
 
 macOS 특이사항:
   - DOC 추출: textutil (내장) 또는 LibreOffice (headless) 사용
-  - OCR: Tesseract (brew install tesseract) 필요
+  - OCR: macOS Vision(pyobjc-framework-Vision 필요) 기본,
+         없으면 Tesseract (brew install tesseract)
   - 단축키: Cmd+Q (종료), Cmd+O (폴더 열기), Esc (중지)
 """
 
 import atexit
+import hashlib
 import json
+import multiprocessing
 import os
 import re
 import shutil
@@ -43,9 +58,10 @@ import threading
 import time
 import tkinter as tk
 import argparse
+import unicodedata
 import zipfile
 import zlib
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from datetime import datetime
 from tkinter import ttk, messagebox, filedialog
 from typing import Callable, Optional
@@ -250,6 +266,16 @@ def clean_text(text: str) -> tuple[str, bool]:
     return text, changed
 
 
+def nfc(s):
+    """경로·파일명 NFC 정규화 (macOS 파일명은 NFD로 들어오는 경우가 많음)"""
+    return unicodedata.normalize("NFC", s) if isinstance(s, str) else s
+
+
+def text_hash(text: str) -> str:
+    """본문해시: 같은 본문을 묶어 집계할 때 쓰는 md5 앞 16자리"""
+    return hashlib.md5(text.encode("utf-8")).hexdigest()[:16] if text else ""
+
+
 # ── 공통 유틸리티 끝 ──────────────────────────────
 
 # ============================================================
@@ -264,7 +290,24 @@ HWPTAG_PARA_TEXT = 67
 # HWP 헤더 압축 플래그 오프셋
 HWP_HEADER_COMPRESSED_OFFSET = 36
 
-SUPPORTED_EXTENSIONS = [".hwp", ".hwpx", ".pdf", ".txt", ".docx", ".doc"]
+IMAGE_EXTENSIONS = [".jpg", ".jpeg", ".png"]
+EXCEL_EXTENSIONS = [".xlsx", ".xlsm", ".xls"]
+SUPPORTED_EXTENSIONS = ([".hwp", ".hwpx", ".hwx", ".pdf", ".txt", ".docx", ".doc"]
+                        + IMAGE_EXTENSIONS + EXCEL_EXTENSIONS + [".zip"])
+
+# PDF 쪽 단위 OCR 판정 기준 (스캔이 섞인 공문서 묶음 약 1.1만 건으로 검증한 값)
+PAGE_MIN_CHARS = 50          # 쪽 글자층이 이보다 적으면 스캔·부실 후보
+WEAK_IMAGE_COVERAGE = 0.3    # 큰 이미지 기준(쪽 면적 비율)
+WEAK_MAX_HANGUL = 100        # 큰 이미지 위 글자층 한글이 이보다 적으면 부실 후보
+ZOOM_COVERAGE = 0.7          # 이미지가 쪽 면적의 이 비율 미만이면 확대 인식 대상
+OCR_DPI = 250                # 쪽 렌더링 해상도
+OCR_MAX_SIDE = 5000          # 렌더링 한 변 상한(초대형 스캔 대비)
+ZOOM_CLIP_SIDE = 3500        # 확대 인식 시 이미지 상자 렌더링 한 변
+
+# zip: 임시 폴더에 풀어 내부 파일을 각각 추출 (원본 폴더에는 쓰지 않음)
+ZIP_MAX_TOTAL = 4 * 1024 * 1024 * 1024   # 압축 1개당 해제 크기 상한 4GB
+ZIP_MAX_DEPTH = 3                        # 중첩 zip 재귀 깊이
+ZIP_DONE_PREFIX = "압축해제_"            # 옆에 이 폴더가 있으면 이미 풀린 zip으로 보고 건너뜀(auto)
 
 # ============================================================
 # 라이브러리 확인
@@ -312,13 +355,47 @@ if not LIBREOFFICE_AVAILABLE:
         LIBREOFFICE_PATH = _lo_found
         LIBREOFFICE_AVAILABLE = True
 
-# ── OCR (Tesseract) ──────────────────────────────
-OCR_AVAILABLE = False
+# ── OCR (Vision 기본, Tesseract 예비) ─────────────
+# Tesseract는 한글을 "세 금 계 산 서"처럼 음절마다 띄어 검색이 안 되므로 예비로만 쓴다.
+VISION_AVAILABLE = False
+try:
+    import Vision
+    import Quartz
+    from Foundation import NSData
+    try:
+        from objc import autorelease_pool as _autorelease_pool
+    except ImportError:
+        from contextlib import nullcontext as _autorelease_pool
+    VISION_AVAILABLE = True
+except ImportError:
+    pass
+
+OPENPYXL_AVAILABLE = False
+try:
+    import openpyxl
+    OPENPYXL_AVAILABLE = True
+except ImportError:
+    pass
+
+XLRD_AVAILABLE = False
+try:
+    import xlrd
+    XLRD_AVAILABLE = True
+except ImportError:
+    pass
+
+OCR_AVAILABLE = False          # Tesseract 사용 가능 여부 (아래에서 판정 후 엔진 기준으로 재설정)
 OCR_UNAVAIL_REASON = ""
 try:
-    import pytesseract
-    from PIL import Image
     import io
+    from PIL import Image
+    Image.MAX_IMAGE_PIXELS = 1_000_000_000   # 초대형 스캔 이미지의 DecompressionBombError 방지
+except ImportError:
+    Image = None
+try:
+    import pytesseract
+    if Image is None:
+        raise ImportError
     _tesseract_paths = [
         "/opt/homebrew/bin/tesseract",       # Apple Silicon Homebrew
         "/usr/local/bin/tesseract",          # Intel Homebrew
@@ -342,6 +419,38 @@ try:
 except ImportError:
     OCR_UNAVAIL_REASON = "pytesseract 또는 Pillow 미설치"
 
+TESSERACT_AVAILABLE = OCR_AVAILABLE
+OCR_ENGINE = "none"
+
+
+def set_ocr_engine(engine: str = "auto") -> str:
+    """OCR 엔진 선택: auto(Vision > Tesseract) / vision / tesseract / none.
+    쓸 수 없는 엔진을 고르면 auto 규칙으로 대체한다. 결정된 엔진 이름을 돌려준다."""
+    global OCR_ENGINE, OCR_AVAILABLE
+    engine = (engine or "auto").lower()
+    if engine == "vision" and VISION_AVAILABLE:
+        OCR_ENGINE = "vision"
+    elif engine == "tesseract" and TESSERACT_AVAILABLE:
+        OCR_ENGINE = "tesseract"
+    elif engine == "none":
+        OCR_ENGINE = "none"
+    else:
+        OCR_ENGINE = ("vision" if VISION_AVAILABLE
+                      else "tesseract" if TESSERACT_AVAILABLE else "none")
+    OCR_AVAILABLE = OCR_ENGINE != "none"
+    return OCR_ENGINE
+
+
+set_ocr_engine("auto")
+
+
+def ocr_status_text() -> str:
+    if OCR_ENGINE == "vision":
+        return "macOS Vision" + (" (예비: Tesseract)" if TESSERACT_AVAILABLE else "")
+    if OCR_ENGINE == "tesseract":
+        return f"Tesseract ({OCR_LANG})" + ("" if VISION_AVAILABLE else " - Vision 미사용(pyobjc 없음)")
+    return "불가 (" + (OCR_UNAVAIL_REASON or "OCR 끔") + ")"
+
 
 # ============================================================
 # 출력 경로 설정 (스크립트와 같은 경로에 저장)
@@ -350,7 +459,7 @@ except ImportError:
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 OUTPUT_DIR = SCRIPT_DIR
 OCR_LANG = "kor+eng"
-PARALLEL_WORKERS = min(os.cpu_count() or 4, 8)
+PARALLEL_WORKERS = min(os.cpu_count() or 4, 6)   # Vision 병렬 검증치: spawn 프로세스 6개(초당 약 5쪽)
 
 
 def safe_print(msg, overwrite=False):
@@ -395,19 +504,325 @@ def parse_filename_metadata(filename):
 # 텍스트 추출 함수들 (PDF/TXT/DOCX/DOC)
 # ============================================================
 
-def ocr_pdf_page(page, dpi=300):
-    if not OCR_AVAILABLE:
+_HANGUL_RE = re.compile(r"[가-힣]")
+_HIRAGANA_RE = re.compile(r"[぀-ゟ]")
+_PUNCT = set("!\"#$%&'()*+,-./:;<=>?@[\\]^_`{|}~")
+
+
+def hangul_count(text) -> int:
+    return len(_HANGUL_RE.findall(text or ""))
+
+
+def garbled(t) -> bool:
+    """글자층이 깨졌는지 판정 (글꼴 대응표 손상으로 엉뚱한 글자가 나오는 PDF 등).
+    대량 스캔 문서 재처리에서 검증한 규칙."""
+    s = re.sub(r"\s+", "", t or "")
+    L = len(s)
+    if L < 30:
+        return False
+    ctrl = sum(1 for c in s if ord(c) < 0x20)
+    s = "".join(c for c in s if ord(c) >= 0x20)     # 글자 사이 구분용 제어문자는 걷어내고 판정
+    L = len(s)
+    if L < 30:
+        return ctrl > 0
+    hang = len(_HANGUL_RE.findall(s))
+    if ctrl and hang / L >= 0.3:                     # 한글 본문 + 제어문자 구분자 → 정상
+        return False
+    if ctrl / (L + ctrl) > 0.02:
+        return True
+    hira = len(_HIRAGANA_RE.findall(s))
+    if hira >= 5 and hira / L >= 0.05:               # 히라가나가 고르게 있음 → 실제 일본어 문서
+        return False
+    ok = hang + sum(1 for c in s if c.isascii())
+    if (L - ok) / L > 0.3:                           # 한글·영문 외 이상 문자가 많음
+        return True
+    if hang / L < 0.05:
+        if sum(1 for c in s if c in _PUNCT) / L > 0.25:
+            return True
+        words = re.findall(r"[A-Za-z]{3,}", t)
+        if len(words) >= 5:
+            nov = sum(1 for w in words if not re.search(r"[aeiouyAEIOUY]", w))
+            if nov / len(words) > 0.4:
+                return True
+    return False
+
+
+# ── 렌더링·OCR 엔진 ──────────────────────────────
+
+def _render_page(page, dpi=OCR_DPI, clip=None, side=None):
+    """쪽(또는 clip 영역)을 렌더링. side를 주면 긴 변을 그 크기로, 어느 경우든 OCR_MAX_SIDE 이하"""
+    rect = clip if clip is not None else page.rect
+    longest = max(rect.width, rect.height)
+    if longest <= 0:
+        return None
+    z = side / longest if side else dpi / 72
+    if longest * z > OCR_MAX_SIDE:
+        z = OCR_MAX_SIDE / longest
+    return page.get_pixmap(matrix=fitz.Matrix(z, z), clip=clip, alpha=False)
+
+
+def _too_small(pix) -> bool:
+    """Vision은 한 변 2px 이하 이미지를 거부(Code 13)하므로 미리 건너뜀"""
+    return pix is None or min(pix.width, pix.height) < 3
+
+
+def _vision_observations(png_bytes):
+    """Vision 문자인식 → [(x0, y0, x1, y1, 글자)] 정규화 좌표(원점 좌상단, 0~1)"""
+    with _autorelease_pool():
+        data = NSData.dataWithBytes_length_(png_bytes, len(png_bytes))
+        src = Quartz.CGImageSourceCreateWithData(data, None)
+        cg = Quartz.CGImageSourceCreateImageAtIndex(src, 0, None)
+        req = Vision.VNRecognizeTextRequest.alloc().init()
+        req.setRecognitionLevel_(0)                       # accurate
+        req.setRecognitionLanguages_(["ko-KR", "en-US"])
+        req.setUsesLanguageCorrection_(True)
+        handler = Vision.VNImageRequestHandler.alloc().initWithCGImage_options_(cg, None)
+        ok, err = handler.performRequests_error_([req], None)
+        if not ok:
+            raise RuntimeError(f"Vision: {err}")
+        out = []
+        for o in req.results() or []:
+            c = o.topCandidates_(1)
+            if not c:
+                continue
+            b = o.boundingBox()                           # 원점 좌하단
+            out.append((b.origin.x, 1 - b.origin.y - b.size.height,
+                        b.origin.x + b.size.width, 1 - b.origin.y, str(c[0].string())))
+        return out
+
+
+def _vision_lines(obs) -> str:
+    """같은 높이의 조각을 한 줄로 묶어 위→아래, 왼→오 순서로 합침"""
+    items = sorted((((y0 + y1) / 2, y1 - y0, x0, s) for x0, y0, x1, y1, s in obs),
+                   key=lambda t: t[0])
+    lines, cur, cy, chh = [], [], None, None
+    for y, hh, x, s in items:
+        if cur and abs(y - cy) > 0.5 * max(hh, chh):
+            lines.append(cur)
+            cur = []
+        if not cur:
+            cy, chh = y, hh
+        cur.append((x, s))
+    if cur:
+        lines.append(cur)
+    return "\n".join("  ".join(s for _, s in sorted(l)) for l in lines)
+
+
+def ocr_pixmap(pix) -> str:
+    """렌더링된 이미지 1장을 현재 OCR 엔진으로 인식"""
+    if _too_small(pix):
         return ""
-    try:
-        mat = fitz.Matrix(dpi / 72, dpi / 72)
-        pix = page.get_pixmap(matrix=mat)
+    if OCR_ENGINE == "vision":
+        return _vision_lines(_vision_observations(pix.tobytes("png")))
+    if OCR_ENGINE == "tesseract":
         img = Image.open(io.BytesIO(pix.tobytes("png")))
         return pytesseract.image_to_string(img, lang=OCR_LANG)
-    except (OSError, RuntimeError):
+    return ""
+
+
+def ocr_pdf_page(page, dpi=OCR_DPI):
+    """PDF 쪽 1개 OCR (오류는 호출한 쪽에서 처리)"""
+    if not OCR_AVAILABLE:
         return ""
+    return ocr_pixmap(_render_page(page, dpi))
 
 
-def ocr_full_pdf(pdf_path, dpi=300):
+# ── 작은 이미지 확대 인식 (Vision 전용) ──────────
+
+def _image_coverages(page):
+    """쪽 안 이미지들이 쪽 면적에서 차지하는 비율 목록. 교집합은 (r & b)로 구한다
+    (Rect.intersect()는 원래 사각형을 바꾸므로 쓰지 않는다)."""
+    A = page.rect.get_area()
+    if A <= 0:
+        return []
+    out = []
+    for info in page.get_image_info():
+        r = fitz.Rect(info["bbox"]) & page.rect
+        if not r.is_empty:
+            out.append(r.get_area() / A)
+    return out
+
+
+def _is_small_image_page(page) -> bool:
+    cov = [c for c in _image_coverages(page) if c > 0.02]
+    return bool(cov) and max(cov) < ZOOM_COVERAGE
+
+
+def _zoom_text(page, page_obs, min_frac=0.02) -> str:
+    """이미지 상자는 잘라 확대해 따로 읽고, 상자 밖 글자는 쪽 전체 인식(page_obs)에서 가져와
+    위→아래로 합친다."""
+    A = page.rect.get_area()
+    boxes = []
+    for info in page.get_image_info():
+        r = fitz.Rect(info["bbox"]) & page.rect
+        if r.is_empty or r.get_area() < min_frac * A or min(r.width, r.height) < 20:
+            continue
+        if any((r & b).get_area() > 0.8 * r.get_area() for b in boxes):
+            continue
+        boxes.append(r)
+    W, Hh = page.rect.width, page.rect.height
+    blocks = []                                           # (top, left, text)
+    for x0, y0, x1, y1, s in page_obs:
+        cx, cy = (x0 + x1) / 2 * W, (y0 + y1) / 2 * Hh
+        if any(b.contains(fitz.Point(cx, cy)) for b in boxes):
+            continue
+        blocks.append((y0 * Hh, x0 * W, s))
+    for b in boxes:
+        try:
+            cp = _render_page(page, clip=b, side=ZOOM_CLIP_SIDE)
+            t = "" if _too_small(cp) else _vision_lines(_vision_observations(cp.tobytes("png")))
+        except RuntimeError:
+            t = ""
+        if t.strip():
+            blocks.append((b.y0, b.x0, t))
+    blocks.sort(key=lambda t: (round(t[0] / 6), t[1]))    # 약 6pt 단위로 같은 줄 판정
+    lines, cur, cy = [], [], None
+    for y, x, s in blocks:
+        key = round(y / 6)
+        if cur and key != cy:
+            lines.append("  ".join(cur))
+            cur = []
+        cy = key
+        cur.append(s)
+    if cur:
+        lines.append("  ".join(cur))
+    return "\n".join(lines)
+
+
+# ── PDF 쪽 단위 판정·추출 ────────────────────────
+
+def _page_kind(page, text):
+    """OCR 대상 쪽 판정: 'scan'(스캔) / 'garbled'(깨진 글자층) / 'weak'(글자층 부실) / None"""
+    L = len(text.strip())
+    has_img = bool(page.get_images())
+    if L < PAGE_MIN_CHARS and has_img:
+        return "scan"
+    if garbled(text):
+        return "garbled"
+    if L < PAGE_MIN_CHARS:
+        # 이미지 없이 도형으로 그린 글자 등. 완전 백지는 건너뜀
+        return "weak" if (L > 0 or page.get_drawings()) else None
+    if (has_img and hangul_count(text) < WEAK_MAX_HANGUL
+            and max(_image_coverages(page) or [0]) >= WEAK_IMAGE_COVERAGE):
+        return "weak"
+    return None
+
+
+def _ocr_page_best(page, text, kind):
+    """판정된 쪽을 OCR해 채택할 본문을 돌려줌. 반환: (본문 또는 None(글자층 유지), 확대 인식 여부)"""
+    pix = _render_page(page)
+    if _too_small(pix):
+        return None, False
+    obs = None
+    if OCR_ENGINE == "vision":
+        obs = _vision_observations(pix.tobytes("png"))
+        a = _vision_lines(obs)
+    else:
+        a = ocr_pixmap(pix)
+    if kind == "weak":      # 글자층이 있는 쪽은 OCR이 확실히 나을 때만 교체
+        adopt = (hangul_count(a) > hangul_count(text) * 1.1 + 5
+                 or (not text.strip() and bool(a.strip())))
+    else:
+        adopt = bool(a.strip())
+    best = a if adopt else None
+    zoomed = False
+    if obs is not None and _is_small_image_page(page):
+        b = _zoom_text(page, obs)
+        ref = best if best is not None else text
+        if hangul_count(b) > hangul_count(ref) * 1.1 + 5:
+            best, zoomed = b, True
+    return best, zoomed
+
+
+def _empty_result(error=None, **extra):
+    r = {"text": "", "pages": 0, "chars_per_page": 0,
+         "is_scanned": False, "ocr_applied": False, "dup_fixed": False}
+    r.update(extra)
+    if error:
+        r["error"] = error
+    return r
+
+
+def extract_pdf(path):
+    """PDF 추출: 쪽마다 글자층을 읽고, 스캔·깨짐·부실 쪽만 OCR로 보완"""
+    doc = None
+    try:
+        doc = fitz.open(path)
+        total = doc.page_count
+        texts = [""] * total
+        ocr_pages, zoom_pages, garbled_pages, cand_pages, ocr_errors = [], [], [], [], []
+
+        def _try(i, page, kind):
+            try:
+                best, zoomed = _ocr_page_best(page, texts[i], kind)
+            except Exception as e:          # 쪽 1개 실패는 기록만 하고 계속
+                ocr_errors.append(f"p{i + 1}: {str(e)[:80]}")
+                return
+            if best is not None:
+                texts[i] = best
+                ocr_pages.append(i + 1)
+                if zoomed:
+                    zoom_pages.append(i + 1)
+
+        for i in range(total):
+            try:
+                page = doc[i]
+                texts[i] = page.get_text("text") or ""
+                kind = _page_kind(page, texts[i])
+            except (OSError, RuntimeError, ValueError) as e:
+                ocr_errors.append(f"p{i + 1}: {str(e)[:80]}")
+                continue
+            if kind:
+                cand_pages.append(i + 1)
+                if kind == "garbled":
+                    garbled_pages.append(i + 1)
+                if OCR_AVAILABLE:
+                    _try(i, page, kind)
+        # 절반 이상 OCR한 스캔 위주 문서: 나머지 쪽도 OCR이 확실히 나을 때만 교체
+        # (글자 일부만 글자층에 있고 나머지는 도형으로 그린 쪽 대비)
+        if OCR_AVAILABLE and total >= 2 and len(ocr_pages) * 2 >= total:
+            for i in range(total):
+                if i + 1 in cand_pages or not texts[i].strip():
+                    continue
+                try:
+                    page = doc[i]
+                except (OSError, RuntimeError, ValueError):
+                    continue
+                cand_pages.append(i + 1)
+                _try(i, page, "weak")
+            cand_pages.sort()
+            ocr_pages.sort()
+            zoom_pages.sort()
+        cleaned, dup = clean_text('\n'.join(t for t in texts if t))
+        cpp = len(cleaned) / max(total, 1)
+        tag = "vision" if OCR_ENGINE == "vision" else "ocr"
+        if not ocr_pages:
+            method = "pdf"
+        elif len(ocr_pages) == total:
+            method = tag
+        else:
+            method = f"pdf+{tag}"
+        r = {"text": cleaned, "pages": total, "chars_per_page": round(cpp, 1),
+             "is_scanned": bool(cand_pages), "ocr_applied": bool(ocr_pages), "dup_fixed": dup,
+             "method": method, "scan_pages": cand_pages, "garbled_pages": garbled_pages}
+        if cand_pages:
+            r["ocr_engine"] = OCR_ENGINE
+        if ocr_pages:
+            r["vision_pages" if OCR_ENGINE == "vision" else "ocr_pages"] = ocr_pages
+        if zoom_pages:
+            r["zoom_pages"] = zoom_pages
+        if ocr_errors:
+            r["ocr_errors"] = ocr_errors
+        return r
+    except (OSError, RuntimeError, ValueError) as e:
+        return _empty_result(str(e))
+    finally:
+        if doc:
+            doc.close()
+
+
+def ocr_full_pdf(pdf_path, dpi=OCR_DPI):
+    """PDF 전 쪽 OCR (하위 호환용)"""
     doc = None
     try:
         doc = fitz.open(pdf_path)
@@ -417,11 +832,10 @@ def ocr_full_pdf(pdf_path, dpi=300):
                 t = ocr_pdf_page(doc[i], dpi)
                 if t:
                     texts.append(t)
-            except (OSError, RuntimeError):
+            except Exception:
                 continue
-        pages = doc.page_count
         cleaned, _ = clean_text('\n'.join(texts))
-        return {"text": cleaned, "pages": pages}
+        return {"text": cleaned, "pages": doc.page_count}
     except (OSError, RuntimeError) as e:
         return {"text": "", "pages": 0, "error": str(e)}
     finally:
@@ -429,38 +843,192 @@ def ocr_full_pdf(pdf_path, dpi=300):
             doc.close()
 
 
-def extract_pdf(path):
+# ── 이미지·엑셀·hwx·zip ─────────────────────────
+
+def extract_image(path):
+    """jpg·png: 원본 해상도(한 변 OCR_MAX_SIDE 이하)로 렌더링해 OCR"""
+    if not OCR_AVAILABLE:
+        return _empty_result("OCR 엔진 없음 (이미지 파일)")
     doc = None
     try:
         doc = fitz.open(path)
-        texts = []
-        total = doc.page_count
-        for i in range(total):
-            try:
-                t = doc[i].get_text("text")
-                if t:
-                    texts.append(t)
-            except (OSError, RuntimeError):
-                continue
-        raw = '\n'.join(texts)
-        cleaned, dup = clean_text(raw)
-        cpp = len(cleaned) / max(total, 1)
-        is_scanned = (len(cleaned) == 0) or (cpp < 50 and total >= 2)
-        ocr_applied = False
-        if is_scanned and OCR_AVAILABLE:
-            ocr_res = ocr_full_pdf(path)
-            if ocr_res.get("text"):
-                cleaned = ocr_res["text"]
-                cpp = len(cleaned) / max(total, 1)
-                ocr_applied = True
-        return {"text": cleaned, "pages": total, "chars_per_page": round(cpp, 1),
-                "is_scanned": is_scanned, "ocr_applied": ocr_applied, "dup_fixed": dup}
-    except (OSError, RuntimeError) as e:
-        return {"text": "", "pages": 0, "chars_per_page": 0,
-                "is_scanned": False, "ocr_applied": False, "dup_fixed": False, "error": str(e)}
+        page = doc[0]
+        info = page.get_image_info()
+        native = max(info[0]["width"], info[0]["height"]) if info else max(page.rect.width, page.rect.height)
+        pix = _render_page(page, side=min(native, OCR_MAX_SIDE))
+        if _too_small(pix):
+            return _empty_result("이미지가 너무 작음 (한 변 2px 이하)", pages=1)
+        cleaned, dup = clean_text(ocr_pixmap(pix))
+        tag = "vision" if OCR_ENGINE == "vision" else "ocr"
+        return {"text": cleaned, "pages": 1, "chars_per_page": len(cleaned),
+                "is_scanned": True, "ocr_applied": bool(cleaned), "dup_fixed": dup,
+                "method": tag, "ocr_engine": OCR_ENGINE,
+                ("vision_pages" if tag == "vision" else "ocr_pages"): [1] if cleaned else []}
+    except Exception as e:
+        return _empty_result(f"이미지 OCR 실패: {str(e)[:120]}")
     finally:
         if doc:
             doc.close()
+
+
+def _excel_rows_text(rows, drop_tail=("",)):
+    out = []
+    for row in rows:
+        cells = ["" if c is None else str(c).replace("\n", " ").strip() for c in row]
+        while cells and cells[-1] in drop_tail:
+            cells.pop()
+        if cells:
+            out.append(" | ".join(cells))
+    return out
+
+
+def extract_excel(path):
+    """xlsx·xlsm(openpyxl)·xls(xlrd): 시트별로 '## [시트] 이름' 머리 + 행마다 ' | ' 구분"""
+    ext = os.path.splitext(path)[1].lower()
+    try:
+        parts, sheets = [], 0
+        if ext in (".xlsx", ".xlsm"):
+            if not OPENPYXL_AVAILABLE:
+                return _empty_result("openpyxl 미설치")
+            wb = openpyxl.load_workbook(path, data_only=True, read_only=True)
+            try:
+                for ws in wb.worksheets:
+                    sheets += 1
+                    parts.append(f"## [시트] {ws.title}")
+                    parts += _excel_rows_text(ws.iter_rows(values_only=True))
+            finally:
+                wb.close()
+        else:
+            if not XLRD_AVAILABLE:
+                return _empty_result("xlrd 미설치")
+            bk = xlrd.open_workbook(path)
+            for ws in bk.sheets():
+                sheets += 1
+                parts.append(f"## [시트] {ws.name}")
+                parts += _excel_rows_text(([c.value for c in ws.row(r)] for r in range(ws.nrows)),
+                                          drop_tail=("", "0.0"))
+        cleaned, dup = clean_text("\n".join(parts))
+        return {"text": cleaned, "pages": sheets, "chars_per_page": 0, "is_scanned": False,
+                "ocr_applied": False, "dup_fixed": dup, "method": "excel", "tables": sheets}
+    except Exception as e:
+        return _empty_result(f"엑셀 추출 실패: {str(e)[:120]}")
+
+
+_OLE_SIG = bytes.fromhex("D0CF11E0A1B11AE1")
+
+
+def extract_hwx(path):
+    """hwx(결재문서): 안에 든 OLE HWP를 찾아 추출, 없으면 평문 한글 조각을 모음"""
+    try:
+        with open(path, "rb") as f:
+            raw = f.read()
+        text, method = "", "hwx_none"
+        off = raw.find(_OLE_SIG)
+        if off >= 0:
+            r = extract_hwp_direct(raw[off:])          # olefile은 바이트열도 받음
+            text = r.get("text", "")
+            if text:
+                method = "hwx_embedded_hwp"
+        if not text:
+            cand = re.findall(rb"(?:[\xea-\xed][\x80-\xbf]{2}){3,}", raw)
+            text = nfc(b" ".join(cand).decode("utf-8", "ignore"))
+            method = "hwx_rawscan" if text else "hwx_none"
+        cleaned, dup = clean_text(text)
+        return {"text": cleaned, "pages": 0, "chars_per_page": 0, "is_scanned": False,
+                "ocr_applied": False, "dup_fixed": dup, "method": method}
+    except Exception as e:
+        return _empty_result(f"hwx 추출 실패: {str(e)[:120]}")
+
+
+def _zip_member_name(info) -> str:
+    """zipfile이 cp437로 잘못 읽은 한글 파일명을 cp949(또는 utf-8)로 복원"""
+    name = info.filename
+    if info.flag_bits & 0x800:                          # UTF-8 표시가 있으면 그대로
+        return nfc(name)
+    try:
+        raw = name.encode("cp437")
+    except UnicodeEncodeError:
+        return nfc(name)
+    for enc in ("cp949", "utf-8"):
+        try:
+            return nfc(raw.decode(enc))
+        except UnicodeDecodeError:
+            continue
+    return nfc(name)
+
+
+def _expand_zip(zip_path, dest_dir, depth=0):
+    """zip을 dest_dir(임시 폴더)에 풀고 [(실제 경로, zip 안 상대경로)]와 오류 목록을 돌려줌.
+    중첩 zip은 ZIP_MAX_DEPTH까지 재귀. 경로 탈출(..)·맥 부속 파일은 건너뜀."""
+    members, errors = [], []
+    try:
+        zf = zipfile.ZipFile(zip_path)
+    except UnicodeDecodeError:
+        raise ValueError("파일명 인코딩 손상(UTF-8 표시가 붙은 비UTF-8 이름), 수동 해제 필요")
+    with zf:
+        infos = [i for i in zf.infolist() if not i.is_dir()]
+        total = sum(i.file_size for i in infos)
+        if total > ZIP_MAX_TOTAL:
+            raise ValueError(f"zip 해제 크기 한도 초과: {total:,} 바이트")
+        for info in infos:
+            parts = [p.replace("\\", "_").strip()[:150] for p in _zip_member_name(info).split("/")]
+            parts = [p for p in parts if p not in ("", ".", "..")]
+            if (not parts or "__MACOSX" in parts or parts[-1].startswith("._")
+                    or parts[-1] == ".DS_Store"):
+                continue
+            target = os.path.join(dest_dir, *parts)
+            if os.path.exists(target):
+                continue
+            os.makedirs(os.path.dirname(target), exist_ok=True)
+            rel = "/".join(parts)
+            try:
+                with zf.open(info) as src, open(target, "wb") as dst:
+                    shutil.copyfileobj(src, dst)
+            except Exception as e:                       # 암호 걸린 항목 등
+                errors.append((rel, str(e)[:120]))
+                continue
+            ext = os.path.splitext(target)[1].lower()
+            if ext == ".zip":
+                if depth >= ZIP_MAX_DEPTH:
+                    errors.append((rel, "중첩 zip 깊이 초과"))
+                    continue
+                try:
+                    sub, sub_err = _expand_zip(target, target + "_풀림", depth + 1)
+                except Exception as e:
+                    errors.append((rel, f"중첩 zip 해제 실패: {str(e)[:100]}"))
+                    continue
+                members += [(p, f"{rel}/{r}") for p, r in sub]
+                errors += [(f"{rel}/{r}", m) for r, m in sub_err]
+            elif ext in SUPPORTED_EXTENSIONS:
+                members.append((target, rel))
+    return members, errors
+
+
+def extract_zip(path):
+    """zip 1개를 통째로 추출 (단일 파일 호출·MCP용). 폴더 일괄 처리(run)에서는
+    zip 안 파일마다 별도 레코드를 만든다."""
+    tmp = tempfile.mkdtemp(prefix="dataman_zip_")
+    try:
+        members, errors = _expand_zip(path, tmp)
+        parts, n_ok = [], 0
+        for real, rel in members:
+            r = _extract_one(real)
+            if r.get("text"):
+                n_ok += 1
+                parts.append(f"### [압축 내부] {rel}\n{r['text']}")
+            if r.get("error"):
+                errors.append((rel, r["error"]))
+        cleaned, dup = clean_text("\n\n".join(parts))
+        res = {"text": cleaned, "pages": len(members), "chars_per_page": 0, "is_scanned": False,
+               "ocr_applied": False, "dup_fixed": dup, "method": "zip",
+               "members": [rel for _, rel in members]}
+        if errors:
+            res["zip_errors"] = [f"{r}: {m}" for r, m in errors]
+        return res
+    except Exception as e:
+        return _empty_result(f"zip 해제 실패: {str(e)[:120]}")
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
 
 
 def extract_txt(path):
@@ -636,6 +1204,14 @@ def extract_text(path, word_extractor=None):
         return extract_docx(path)
     elif ext == ".doc":
         return extract_doc(path, word_extractor)
+    elif ext in IMAGE_EXTENSIONS:
+        return extract_image(path)
+    elif ext in EXCEL_EXTENSIONS:
+        return extract_excel(path)
+    elif ext == ".hwx":
+        return extract_hwx(path)
+    elif ext == ".zip":
+        return extract_zip(path)
     return {"text": "", "pages": 0, "chars_per_page": 0,
             "is_scanned": False, "ocr_applied": False, "dup_fixed": False,
             "error": f"미지원 형식: {ext}"}
@@ -885,19 +1461,35 @@ def extract_hwpx_direct(path):
 def get_file_type(filename):
     ext = os.path.splitext(filename)[1].lower()
     return {".pdf": "pdf", ".txt": "txt", ".docx": "docx", ".doc": "doc",
-            ".hwp": "hwp", ".hwpx": "hwpx"}.get(ext, "unknown")
+            ".hwp": "hwp", ".hwpx": "hwpx", ".hwx": "hwx",
+            ".jpg": "jpg", ".jpeg": "jpeg", ".png": "png",
+            ".xlsx": "xlsx", ".xlsm": "xlsm", ".xls": "xls", ".zip": "zip"}.get(ext, "unknown")
 
 
-def _build_entry(file_path, result, input_folder):
-    """파일 1건의 추출 결과를 표준 entry dict로 변환 (JSON/JSONL 공통)"""
-    filename = os.path.basename(file_path)
-    rel_path = os.path.relpath(file_path, input_folder)
-    parent_folder = os.path.basename(os.path.dirname(file_path))
+# 추출 결과에서 entry로 그대로 옮기는 선택 필드 (있을 때만)
+_OPTIONAL_FIELDS = ("tables", "ocr_engine", "vision_pages", "ocr_pages", "zoom_pages",
+                    "garbled_pages", "ocr_errors", "members", "zip_errors")
+
+
+def _build_entry(file_path, result, input_folder, rel_path=None, archive=None):
+    """파일 1건의 추출 결과를 표준 entry dict로 변환 (JSON/JSONL 공통).
+    rel_path: zip 안 파일처럼 실제 경로와 다른 상대경로를 쓸 때 지정
+    archive: zip 안 파일이면 그 zip의 상대경로"""
+    if rel_path is None:
+        rel_path = os.path.relpath(file_path, input_folder)
+        parent_folder = os.path.basename(os.path.dirname(file_path))
+    else:
+        parent_folder = (os.path.basename(os.path.dirname(rel_path))
+                         or os.path.basename(os.path.abspath(input_folder)))
+    rel_path = nfc(rel_path)
+    filename = nfc(os.path.basename(rel_path))
     meta = parse_filename_metadata(filename)
     orig_type = get_file_type(filename)
-    ext = os.path.splitext(file_path)[1].lower()
+    ext = os.path.splitext(filename)[1].lower()
 
-    if ext == ".hwpx":
+    if result.get("method"):
+        method = result["method"]
+    elif ext == ".hwpx":
         method = "hwpx_direct"
     elif ext == ".hwp":
         method = "hwp_direct"
@@ -906,19 +1498,24 @@ def _build_entry(file_path, result, input_folder):
     else:
         method = "ocr" if result.get("ocr_applied") else orig_type
 
+    text = result.get("text", "")
     entry = {
         "filename": filename, "file_type": orig_type,
-        "file_no": meta["file_no"], "inst_name": meta["inst_name"],
-        "title": meta["title"], "text": result.get("text", ""),
+        "file_no": meta["file_no"], "inst_name": nfc(meta["inst_name"]),
+        "title": nfc(meta["title"]), "text": text,
         "pages": result.get("pages", 0),
-        "text_length": len(result.get("text", "")),
+        "text_length": len(text),
         "extraction_method": method,
-        "dup_fixed": result.get("dup_fixed", False),
-        "folder": parent_folder,
+        "dup_fixed": result.get("dup_fixed", False),   # 공백 정리 여부 (필드명은 하위 호환 유지)
+        "folder": nfc(parent_folder),
         "rel_path": rel_path,
+        "본문해시": text_hash(text),
     }
-    if "tables" in result:
-        entry["tables"] = result["tables"]
+    for k in _OPTIONAL_FIELDS:
+        if result.get(k):
+            entry[k] = result[k]
+    if archive:
+        entry["archive"] = nfc(archive)
     if result.get("error"):
         entry["error"] = result["error"]
     return entry
@@ -940,6 +1537,14 @@ def _extract_one(file_path):
             return extract_docx(file_path)
         elif ext == ".doc":
             return extract_doc(file_path)  # textutil은 thread-safe
+        elif ext in IMAGE_EXTENSIONS:
+            return extract_image(file_path)
+        elif ext in EXCEL_EXTENSIONS:
+            return extract_excel(file_path)
+        elif ext == ".hwx":
+            return extract_hwx(file_path)
+        elif ext == ".zip":
+            return extract_zip(file_path)
         return {"text": "", "pages": 0, "chars_per_page": 0,
                 "is_scanned": False, "ocr_applied": False, "dup_fixed": False,
                 "error": f"미지원 형식: {ext}"}
@@ -953,8 +1558,124 @@ def _extract_one(file_path):
 # 메인 처리
 # ============================================================
 
+def _worker_init(engine, lang):
+    """spawn 방식 작업 프로세스 초기화: 부모의 OCR 설정을 넘겨받는다"""
+    global OCR_LANG
+    OCR_LANG = lang
+    set_ocr_engine(engine)
+    try:
+        fitz.TOOLS.mupdf_display_errors(False)
+    except Exception:
+        pass
+
+
+def _collect_tasks(input_folder, zip_mode, tmp_holder):
+    """대상 파일 수집. 반환: (작업 목록, 건너뛴 zip 목록)
+    작업 = {"path": 실제 경로, "rel": 상대경로, "archive": zip 상대경로 또는 None,
+            "preset": 미리 정해진 결과(해제 실패 등) 또는 None}"""
+    tasks, skipped = [], []
+    for root, dirs, files in os.walk(input_folder):
+        dirs.sort()
+        for f in sorted(files):
+            if f.startswith("._") or f == ".DS_Store":
+                continue
+            ext = os.path.splitext(f)[1].lower()
+            if ext not in SUPPORTED_EXTENSIONS:
+                continue
+            p = os.path.join(root, f)
+            rel = os.path.relpath(p, input_folder)
+            if ext != ".zip":
+                tasks.append({"path": p, "rel": rel, "archive": None, "preset": None})
+                continue
+            done_dir = os.path.join(root, ZIP_DONE_PREFIX + os.path.splitext(f)[0])
+            if zip_mode == "skip" or (zip_mode == "auto" and os.path.isdir(done_dir)):
+                skipped.append(rel)
+                continue
+            if tmp_holder[0] is None:
+                tmp_holder[0] = tempfile.mkdtemp(prefix="dataman_zip_")
+            dest = os.path.join(tmp_holder[0], f"z{len(tasks):06d}")
+            try:
+                members, errors = _expand_zip(p, dest)
+            except Exception as e:
+                tasks.append({"path": p, "rel": rel, "archive": None,
+                              "preset": _empty_result(f"zip 해제 실패: {str(e)[:120]}")})
+                continue
+            for real, mrel in members:
+                tasks.append({"path": real, "rel": os.path.join(rel, mrel),
+                              "archive": rel, "preset": None})
+            for mrel, msg in errors:
+                tasks.append({"path": None, "rel": os.path.join(rel, mrel), "archive": rel,
+                              "preset": _empty_result(f"zip 항목 해제 실패: {msg}")})
+    tasks.sort(key=lambda t: nfc(t["rel"]))
+    return tasks, skipped
+
+
+def build_checklist(entries, skipped_zips=(), title=""):
+    """점검표(마크다운) 줄 목록: 본문 0자·50자 미만·섞인 스캔 쪽·깨진 글자층·오류·같은 본문"""
+    empty = [e for e in entries if not e["text"]]
+    short = [e for e in entries if 0 < e["text_length"] < 50]
+    mixed = [e for e in entries if "+" in e["extraction_method"]]
+    full_ocr = [e for e in entries if e["extraction_method"] in ("vision", "ocr")
+                and e["file_type"] == "pdf"]
+    garb = [e for e in entries if e.get("garbled_pages")]
+    errs = [e for e in entries if e.get("error") or e.get("ocr_errors") or e.get("zip_errors")]
+    zoom = [e for e in entries if e.get("zoom_pages")]
+    hashes = {}
+    for e in entries:
+        if e["본문해시"]:
+            hashes[e["본문해시"]] = hashes.get(e["본문해시"], 0) + 1
+    dup_groups = [c for c in hashes.values() if c > 1]
+    ocr_pg = sum(len(e.get("vision_pages") or e.get("ocr_pages") or []) for e in entries)
+    methods = {}
+    for e in entries:
+        methods[e["extraction_method"]] = methods.get(e["extraction_method"], 0) + 1
+
+    def pages_str(lst):
+        s = ",".join(map(str, lst[:15]))
+        return s + (f" 외 {len(lst) - 15}쪽" if len(lst) > 15 else "")
+
+    L = [f"# DataMan 점검표{(' - ' + title) if title else ''}", "",
+         f"- 생성: {datetime.now():%Y-%m-%d %H:%M}",
+         f"- OCR 엔진: {ocr_status_text()}",
+         f"- 레코드 {len(entries):,}건 · 글자 {sum(e['text_length'] for e in entries):,}자",
+         f"- OCR로 읽은 쪽 {ocr_pg:,}쪽 (확대 인식 채택 "
+         f"{sum(len(e.get('zoom_pages', [])) for e in entries):,}쪽)",
+         f"- 같은 본문 2건 이상 묶음 {len(dup_groups):,}개 ({sum(dup_groups):,}건) "
+         f"→ 건수 집계는 `본문해시`로 묶을 것",
+         "", "## 요약", "",
+         "| 항목 | 건수 |", "|---|---|",
+         f"| 본문 0자 | {len(empty):,} |",
+         f"| 본문 50자 미만 | {len(short):,} |",
+         f"| 섞인 스캔(일부 쪽만 OCR) | {len(mixed):,} |",
+         f"| 전 쪽 OCR PDF | {len(full_ocr):,} |",
+         f"| 깨진 글자층 쪽이 있는 파일 | {len(garb):,} |",
+         f"| 작은 이미지 확대 인식 파일 | {len(zoom):,} |",
+         f"| 오류 | {len(errs):,} |",
+         f"| 건너뛴 zip(이미 압축해제 폴더 있음) | {len(skipped_zips):,} |",
+         "", "## 추출 방식", ""]
+    L += [f"- {k}: {v:,}건" for k, v in sorted(methods.items(), key=lambda kv: -kv[1])]
+    L += ["", f"## 본문 0자 ({len(empty):,}건)", ""]
+    L += [f"- {e['rel_path']}" + (f" ({e['error'][:60]})" if e.get("error") else "") for e in empty]
+    L += ["", f"## 본문 50자 미만 ({len(short):,}건)", ""]
+    L += [f"- {e['rel_path']} : {e['text'][:40]!r}" for e in short]
+    L += ["", f"## 섞인 스캔 쪽 ({len(mixed):,}건, OCR 쪽 번호)", ""]
+    L += [f"- {e['rel_path']} : {pages_str(e.get('vision_pages') or e.get('ocr_pages') or [])}"
+          f" / 전체 {e['pages']}쪽" for e in mixed]
+    L += ["", f"## 깨진 글자층 ({len(garb):,}건, 쪽 번호)", ""]
+    L += [f"- {e['rel_path']} : {pages_str(e['garbled_pages'])}" for e in garb]
+    L += ["", f"## 오류 ({len(errs):,}건)", ""]
+    for e in errs:
+        msg = e.get("error") or "; ".join((e.get("ocr_errors") or e.get("zip_errors") or [])[:3])
+        L.append(f"- {e['rel_path']} : {str(msg)[:120]}")
+    if skipped_zips:
+        L += ["", f"## 건너뛴 zip ({len(skipped_zips):,}건)", ""]
+        L += [f"- {nfc(z)}" for z in skipped_zips]
+    return L
+
+
 def run(input_folder, output_dir=None, log_callback=None, progress_callback=None,
-        done_callback=None, stop_event=None, output_format='json'):
+        done_callback=None, stop_event=None, output_format='json',
+        workers=None, zip_mode='auto'):
     """통합 전처리 실행 (하위 폴더 항상 포함)
     output_dir: 결과 저장 폴더 (None이면 OUTPUT_DIR 사용)
     log_callback(msg): GUI 로그 출력
@@ -962,6 +1683,8 @@ def run(input_folder, output_dir=None, log_callback=None, progress_callback=None
     done_callback(summary_text): 완료 시 호출
     stop_event: threading.Event -- set()하면 중단
     output_format: 'json' (단일 통합 JSON) 또는 'jsonl' (라인별 JSON, 스트리밍/중단 안전)
+    workers: 작업 프로세스 수 (None이면 PARALLEL_WORKERS)
+    zip_mode: 'auto'(옆에 압축해제_ 폴더가 있으면 건너뜀) / 'expand'(항상 풂) / 'skip'(zip 무시)
     """
     if stop_event is None:
         stop_event = threading.Event()
@@ -970,6 +1693,8 @@ def run(input_folder, output_dir=None, log_callback=None, progress_callback=None
     output_format = (output_format or 'json').lower()
     if output_format not in ('json', 'jsonl'):
         output_format = 'json'
+    if zip_mode not in ('auto', 'expand', 'skip'):
+        zip_mode = 'auto'
 
     def _log(msg, overwrite=False):
         if log_callback:
@@ -980,33 +1705,45 @@ def run(input_folder, output_dir=None, log_callback=None, progress_callback=None
     now = datetime.now()
     timestamp = now.strftime('%Y-%m-%d %H:%M:%S')
     ts_file = now.strftime('%Y%m%d_%H%M%S')
-    folder_name = os.path.basename(os.path.abspath(input_folder))
+    folder_name = nfc(os.path.basename(os.path.abspath(input_folder)))
     out_ext = 'jsonl' if output_format == 'jsonl' else 'json'
     OUTPUT_JSON = os.path.join(save_dir, f"dataman_{folder_name}_{ts_file}.{out_ext}")
     EXTRACT_LOG = os.path.join(save_dir, f"추출로그_{folder_name}_{ts_file}.txt")
+    CHECKLIST = os.path.join(save_dir, f"점검표_{folder_name}_{ts_file}.md")
 
     _log(f"{'='*50}")
-    _log(f"  DataMan for Mac")
-    _log(f"  HWP/HWPX/PDF/TXT/DOC/DOCX -> {out_ext.upper()}")
+    _log(f"  DataMan for Mac v1.2")
+    _log(f"  HWP/HWPX/HWX/PDF/TXT/DOC/DOCX/XLSX/XLS/이미지/ZIP -> {out_ext.upper()}")
     _log(f"{'='*50}")
     _log(f"  대상 폴더 : {input_folder}")
     _log(f"  저장 경로 : {OUTPUT_JSON}")
     _log(f"  출력 형식 : {output_format} ({'스트리밍' if output_format == 'jsonl' else '단일 통합'})")
     _log(f"  추출 로그 : {EXTRACT_LOG}")
-    _log(f"  OCR      : {'가능 (' + OCR_LANG + ')' if OCR_AVAILABLE else '불가 (' + OCR_UNAVAIL_REASON + ')'}")
+    _log(f"  점검표    : {CHECKLIST}")
+    _log(f"  OCR      : {ocr_status_text()}")
     _doc_tool = "textutil" if TEXTUTIL_AVAILABLE else ("LibreOffice" if LIBREOFFICE_AVAILABLE else "불가")
     _log(f"  DOC 추출 : {_doc_tool}")
+    _log(f"  zip 처리 : {zip_mode}")
     _log(f"{'='*50}")
 
-    # -- 파일 수집 (항상 재귀) --
-    all_files = []
-    for root, dirs, files in os.walk(input_folder):
-        for f in sorted(files):
-            if os.path.splitext(f)[1].lower() in SUPPORTED_EXTENSIONS:
-                all_files.append(os.path.join(root, f))
-    all_files.sort()
+    # -- 파일 수집 (항상 재귀, zip은 임시 폴더에 풀어 내부 파일을 작업으로 추가) --
+    tmp_holder = [None]
+    try:
+        tasks, skipped_zips = _collect_tasks(input_folder, zip_mode, tmp_holder)
+        _run_tasks(input_folder, tasks, skipped_zips, save_dir, output_format, workers,
+                   OUTPUT_JSON, EXTRACT_LOG, CHECKLIST, folder_name, ts_file, timestamp,
+                   _log, progress_callback, done_callback, stop_event)
+    finally:
+        if tmp_holder[0]:
+            shutil.rmtree(tmp_holder[0], ignore_errors=True)
 
-    if not all_files:
+
+def _run_tasks(input_folder, tasks, skipped_zips, save_dir, output_format, workers,
+               OUTPUT_JSON, EXTRACT_LOG, CHECKLIST, folder_name, ts_file, timestamp,
+               _log, progress_callback, done_callback, stop_event):
+    if skipped_zips:
+        _log(f"건너뛴 zip {len(skipped_zips)}개 (옆에 {ZIP_DONE_PREFIX} 폴더가 이미 있음)")
+    if not tasks:
         _log(f"오류: 지원 파일이 없습니다. ({', '.join(SUPPORTED_EXTENSIONS)})")
         if done_callback:
             done_callback("지원 파일 없음")
@@ -1015,55 +1752,32 @@ def run(input_folder, output_dir=None, log_callback=None, progress_callback=None
     # 형식별 집계
     type_counts = {}
     has_doc = False
-    for f in all_files:
-        ext = os.path.splitext(f)[1].lower()
-        ft = get_file_type(os.path.basename(f)).upper()
+    for t in tasks:
+        ft = get_file_type(t["rel"]).upper()
         type_counts[ft] = type_counts.get(ft, 0) + 1
-        if ext == ".doc":
+        if ft == "DOC":
             has_doc = True
+    n_zip_members = sum(1 for t in tasks if t["archive"])
 
-    total = len(all_files)
+    total = len(tasks)
     type_strs = [f"{ft} {cnt}개" for ft, cnt in sorted(type_counts.items())]
-    _log(f"대상 파일: {total}개 ({', '.join(type_strs)})")
+    _log(f"대상 파일: {total}개 ({', '.join(type_strs)})"
+         + (f" / 그중 zip 내부 {n_zip_members}개" if n_zip_members else ""))
+    if has_doc and not (TEXTUTIL_AVAILABLE or LIBREOFFICE_AVAILABLE):
+        _log("경고: textutil/LibreOffice 미설치 -- DOC 파일은 추출되지 않습니다.")
 
-    # -- DOC 추출 도구 준비 --
-    word_extractor = None
-    if has_doc:
-        if TEXTUTIL_AVAILABLE:
-            word_extractor = TextutilExtractor()
-            try:
-                word_extractor.start()
-                _log("textutil 준비 완료.")
-            except Exception as e:
-                _log(f"textutil 시작 실패: {e}")
-                word_extractor = None
-        elif LIBREOFFICE_AVAILABLE:
-            _log("textutil 미사용 -- LibreOffice를 대체 사용합니다.")
-        else:
-            _log("경고: textutil/LibreOffice 미설치 -- DOC 파일은 건너뜁니다.")
-
-    # cleanup 등록
-    def _cleanup_extractor():
-        if word_extractor:
-            try:
-                word_extractor.quit()
-            except Exception:
-                pass
-    atexit.register(_cleanup_extractor)
-
-    # -- 텍스트 추출 (병렬) --
-    # macOS: textutil은 thread-safe이므로 DOC 포함 전체 병렬 처리
-    parallel_indices = list(range(total))
-
-    workers = min(PARALLEL_WORKERS, len(parallel_indices)) if parallel_indices else 1
-    _log(f"텍스트 추출 시작 ({total}건, 워커 {workers}개)")
+    # -- 텍스트 추출 (spawn 방식 작업 프로세스: Vision·PyMuPDF를 프로세스마다 따로 씀) --
+    run_idx = [i for i, t in enumerate(tasks) if t["preset"] is None]
+    n_workers = max(1, min(workers or PARALLEL_WORKERS, len(run_idx) or 1))
+    _log(f"텍스트 추출 시작 ({total}건, 작업 프로세스 {n_workers}개)")
     _log(f"{'='*50}")
 
     extraction_results = [None] * total
+    for i, t in enumerate(tasks):
+        if t["preset"] is not None:
+            extraction_results[i] = t["preset"]
     start_time = time.time()
     done_count = 0
-
-    # ETA 계산기
     eta_calc = ETACalculator(total)
 
     # JSONL 모드: 라인별 즉시 기록 (스트리밍·중단 안전)
@@ -1071,51 +1785,58 @@ def run(input_folder, output_dir=None, log_callback=None, progress_callback=None
     if output_format == 'jsonl':
         jsonl_fp = open(OUTPUT_JSON, 'w', encoding='utf-8')
 
+    def _emit(idx, result):
+        nonlocal done_count
+        done_count += 1
+        t = tasks[idx]
+        filename = nfc(os.path.basename(t["rel"]))
+        ft = get_file_type(filename).upper()
+        if jsonl_fp is not None:
+            try:
+                entry = _build_entry(t["path"] or t["rel"], result, input_folder,
+                                     rel_path=t["rel"] if t["archive"] or t["path"] is None else None,
+                                     archive=t["archive"])
+                jsonl_fp.write(json.dumps(entry, ensure_ascii=False) + '\n')
+                jsonl_fp.flush()
+            except OSError as e:
+                _log(f"JSONL 기록 실패: {e}")
+        pct = done_count * 100 // total
+        eta_str = eta_calc.update(done_count)
+        progress = f"[{done_count}/{total} {pct}%{(' ' + eta_str) if eta_str else ''}]"
+        text_len = len(result.get("text", ""))
+        n_ocr = len(result.get("vision_pages") or result.get("ocr_pages") or [])
+        ocr_note = f" (OCR {n_ocr}쪽)" if n_ocr and ft == "PDF" else ""
+        if result.get("error"):
+            _log(f"  {progress} [X] [{ft}] {filename[:45]}", overwrite=True)
+        elif text_len == 0:
+            _log(f"  {progress} [!] [{ft}] {filename[:45]}  텍스트 없음", overwrite=True)
+        else:
+            _log(f"  {progress} [O] [{ft}] {filename[:45]}  {text_len:,}자{ocr_note}", overwrite=True)
+        if progress_callback:
+            progress_callback(done_count, total)
+
     try:
-        # 병렬 추출 (HWP/HWPX/PDF/TXT/DOCX/DOC 모두 포함)
-        if parallel_indices:
-            with ThreadPoolExecutor(max_workers=workers) as pool:
-                future_to_idx = {
-                    pool.submit(_extract_one, all_files[i]): i
-                    for i in parallel_indices
-                }
+        for i, t in enumerate(tasks):
+            if t["preset"] is not None:
+                _emit(i, t["preset"])
+        if run_idx:
+            ctx = multiprocessing.get_context("spawn")
+            with ProcessPoolExecutor(max_workers=n_workers, mp_context=ctx,
+                                     initializer=_worker_init,
+                                     initargs=(OCR_ENGINE, OCR_LANG)) as pool:
+                future_to_idx = {pool.submit(_extract_one, tasks[i]["path"]): i for i in run_idx}
                 for future in as_completed(future_to_idx):
                     if stop_event.is_set():
                         _log("사용자에 의해 중단되었습니다.")
                         pool.shutdown(wait=False, cancel_futures=True)
                         break
                     idx = future_to_idx[future]
-                    done_count += 1
-                    filename = os.path.basename(all_files[idx])
-                    ft = get_file_type(filename).upper()
-                    result = future.result()
+                    try:
+                        result = future.result()
+                    except Exception as e:           # 작업 프로세스 비정상 종료 등
+                        result = _empty_result(f"작업 프로세스 오류: {str(e)[:120]}")
                     extraction_results[idx] = result
-
-                    # JSONL 즉시 기록 (스트리밍·부분 저장 자동)
-                    if jsonl_fp is not None:
-                        try:
-                            entry = _build_entry(all_files[idx], result, input_folder)
-                            jsonl_fp.write(json.dumps(entry, ensure_ascii=False) + '\n')
-                            jsonl_fp.flush()
-                        except OSError as e:
-                            _log(f"JSONL 기록 실패: {e}")
-
-                    # 진행률 표시 (ETACalculator 사용)
-                    pct = done_count * 100 // total
-                    eta_str = eta_calc.update(done_count)
-                    if eta_str:
-                        eta_str = f" {eta_str}"
-                    progress = f"[{done_count}/{total} {pct}%{eta_str}]"
-
-                    text_len = len(result.get("text", ""))
-                    if result.get("error"):
-                        _log(f"  {progress} [X] [{ft}] {filename[:45]}", overwrite=True)
-                    elif text_len == 0:
-                        _log(f"  {progress} [!] [{ft}] {filename[:45]}  텍스트 없음", overwrite=True)
-                    else:
-                        _log(f"  {progress} [O] [{ft}] {filename[:45]}  {text_len:,}자", overwrite=True)
-                    if progress_callback:
-                        progress_callback(done_count, total)
+                    _emit(idx, result)
     finally:
         if jsonl_fp is not None:
             try:
@@ -1123,14 +1844,16 @@ def run(input_folder, output_dir=None, log_callback=None, progress_callback=None
             except Exception:
                 pass
 
+    def _entry(i, res):
+        t = tasks[i]
+        return _build_entry(t["path"] or t["rel"], res, input_folder,
+                            rel_path=t["rel"] if t["archive"] or t["path"] is None else None,
+                            archive=t["archive"])
+
     # 중단 처리: 부분 결과 저장
     if stop_event.is_set():
         if output_format == 'json':
-            partial_results = []
-            for i, fp in enumerate(all_files):
-                res = extraction_results[i]
-                if res is not None:
-                    partial_results.append(_build_entry(fp, res, input_folder))
+            partial_results = [_entry(i, r) for i, r in enumerate(extraction_results) if r is not None]
             if partial_results:
                 partial_path = os.path.join(
                     save_dir, f"dataman_partial_{folder_name}_{ts_file}.json"
@@ -1147,7 +1870,7 @@ def run(input_folder, output_dir=None, log_callback=None, progress_callback=None
             done_callback("사용자 중단")
         return
 
-    # 결과 조립 (원래 파일 순서 유지)
+    # 결과 조립 (파일 순서 유지)
     results = []
     log_lines = []
     stats = {
@@ -1155,23 +1878,19 @@ def run(input_folder, output_dir=None, log_callback=None, progress_callback=None
         "ocr_ok": 0, "ocr_fail": 0, "error": 0,
         "dup_fixed": 0, "total_chars": 0,
     }
-    for idx, file_path in enumerate(all_files):
-        rel_path = os.path.relpath(file_path, input_folder)
+    for idx in range(total):
         result = extraction_results[idx]
-
         if result is None:
-            # 중단으로 미처리된 파일
-            result = {"text": "", "pages": 0, "chars_per_page": 0,
-                      "is_scanned": False, "ocr_applied": False, "dup_fixed": False,
-                      "error": "중단됨"}
-
-        entry = _build_entry(file_path, result, input_folder)
+            result = _empty_result("중단됨")
+        entry = _entry(idx, result)
         results.append(entry)
+        rel_path = entry["rel_path"]
 
         text_len = entry["text_length"]
         stats["total_chars"] += text_len
         if result.get("dup_fixed"):
             stats["dup_fixed"] += 1
+        extra = " [공백정리]" if result.get("dup_fixed") else ""
 
         # 로그 기록 (파일 순서)
         if result.get("error"):
@@ -1179,34 +1898,31 @@ def run(input_folder, output_dir=None, log_callback=None, progress_callback=None
             log_lines.append(f"[X] {rel_path} -- {result['error']}")
         elif result.get("ocr_applied"):
             stats["ocr_ok"] += 1
-            extra = " [중복보정]" if result.get("dup_fixed") else ""
-            log_lines.append(f"[OCR] {rel_path} -- {text_len:,}자{extra}")
+            pg = result.get("vision_pages") or result.get("ocr_pages") or []
+            log_lines.append(f"[OCR] {rel_path} -- {text_len:,}자 ({entry['extraction_method']}, "
+                             f"{len(pg)}쪽){extra}")
         elif result.get("is_scanned") and text_len == 0:
             if OCR_AVAILABLE:
                 stats["ocr_fail"] += 1
                 log_lines.append(f"[!] {rel_path} -- OCR 실패")
             else:
                 stats["scanned"] += 1
-                log_lines.append(f"[!] {rel_path} -- 스캔본 (OCR 미설치)")
+                log_lines.append(f"[!] {rel_path} -- 스캔본 (OCR 미사용)")
         elif text_len == 0:
             stats["empty"] += 1
             log_lines.append(f"[!] {rel_path} -- 텍스트 없음")
         else:
             stats["success"] += 1
-            extra = " [중복보정]" if result.get("dup_fixed") else ""
             log_lines.append(f"[O] {rel_path} -- {text_len:,}자{extra}")
 
-    # -- extractor 종료 --
-    if word_extractor:
-        try:
-            word_extractor.quit()
-        except Exception:
-            pass
-
-    # -- 결과 저장 (JSONL은 이미 라인별 기록 완료) --
+    # -- 결과 저장 (JSONL은 이미 라인별 기록 완료, 파일 순서로 다시 정렬해 씀) --
     if output_format == 'json':
         with open(OUTPUT_JSON, 'w', encoding='utf-8') as f:
             json.dump(results, f, ensure_ascii=False, indent=2)
+    else:
+        with open(OUTPUT_JSON, 'w', encoding='utf-8') as f:
+            for e in results:
+                f.write(json.dumps(e, ensure_ascii=False) + '\n')
 
     # -- 최종 집계 --
     elapsed = time.time() - start_time
@@ -1218,7 +1934,7 @@ def run(input_folder, output_dir=None, log_callback=None, progress_callback=None
         f"  텍스트 추출 성공 : {stats['success']}개",
     ]
     if stats["ocr_ok"] > 0:
-        summary_lines.append(f"  OCR 추출 성공    : {stats['ocr_ok']}개")
+        summary_lines.append(f"  OCR 보완 추출    : {stats['ocr_ok']}개")
     if stats["ocr_fail"] > 0:
         summary_lines.append(f"  OCR 추출 실패    : {stats['ocr_fail']}개")
     if stats["scanned"] > 0:
@@ -1228,7 +1944,9 @@ def run(input_folder, output_dir=None, log_callback=None, progress_callback=None
     if stats["error"] > 0:
         summary_lines.append(f"  오류 발생        : {stats['error']}개")
     if stats["dup_fixed"] > 0:
-        summary_lines.append(f"  글자중복 보정    : {stats['dup_fixed']}개")
+        summary_lines.append(f"  공백 정리        : {stats['dup_fixed']}개")
+    if skipped_zips:
+        summary_lines.append(f"  건너뛴 zip       : {len(skipped_zips)}개")
     summary_lines += [
         f"  총 글자 수       : {stats['total_chars']:,}자",
         f"  평균 글자 수     : {stats['total_chars'] // max(total, 1):,}자/파일",
@@ -1236,12 +1954,26 @@ def run(input_folder, output_dir=None, log_callback=None, progress_callback=None
         f"",
         f"  JSON 저장 : {OUTPUT_JSON} ({file_size:.1f} MB)",
         f"  추출 로그 : {EXTRACT_LOG}",
+        f"  점검표    : {CHECKLIST}",
     ]
+
+    # -- 점검표 (자동 출력) --
+    checklist = build_checklist(results, skipped_zips, folder_name)
+    try:
+        with open(CHECKLIST, 'w', encoding='utf-8') as f:
+            f.write("\n".join(checklist) + "\n")
+    except OSError as e:
+        _log(f"점검표 저장 실패: {e}")
 
     # -- 최종 출력 --
     _log(f"{'='*50}")
     for line in summary_lines:
         _log(f"  {line}" if line and not line.startswith("  ") else line)
+    _log(f"{'='*50}")
+    _log("[점검표 요약]")
+    for line in checklist:
+        if line.startswith("| ") and not line.startswith("| 항목"):
+            _log("  " + line.strip("| ").replace(" | ", " : "))
     _log(f"{'='*50}")
 
     # -- 추출로그.txt 저장 --
@@ -1343,7 +2075,8 @@ class DataManGUI:
         self.status_label.pack(side="left", padx=12)
 
         _doc_status = "O" if TEXTUTIL_AVAILABLE else ("LO" if LIBREOFFICE_AVAILABLE else "X")
-        env_txt = f"OCR: {'O' if OCR_AVAILABLE else 'X'} | DOC: {_doc_status} | HWP/HWPX: 직접파싱"
+        _ocr_status = {"vision": "Vision", "tesseract": "Tesseract"}.get(OCR_ENGINE, "X")
+        env_txt = f"OCR: {_ocr_status} | DOC: {_doc_status} | HWP/HWPX: 직접파싱"
         ttk.Label(ctrl_frame, text=env_txt, foreground="gray").pack(side="right")
 
         # -- 프로그레스바 --
@@ -1517,11 +2250,20 @@ if __name__ == "__main__":
                         help="출력 형식 -- json: 단일 통합 / jsonl: 라인별 스트리밍·중단 안전 (기본 json)")
     parser.add_argument("--ocr-lang", default="kor+eng",
                         help="Tesseract OCR 언어 (기본: kor+eng)")
+    parser.add_argument("--ocr-engine", choices=["auto", "vision", "tesseract", "none"],
+                        default="auto",
+                        help="OCR 엔진 (기본 auto: Vision, 없으면 Tesseract)")
+    parser.add_argument("--workers", type=int, default=None,
+                        help=f"작업 프로세스 수 (기본 {PARALLEL_WORKERS})")
+    parser.add_argument("--zip", dest="zip_mode", choices=["auto", "expand", "skip"],
+                        default="auto",
+                        help="zip 처리: auto(옆에 압축해제_ 폴더 있으면 건너뜀) / expand / skip")
     parser.add_argument("--cli", action="store_true", help="CLI 모드 (GUI 없이)")
     args = parser.parse_args()
 
     # OCR 언어 설정 반영
     OCR_LANG = args.ocr_lang
+    set_ocr_engine(args.ocr_engine)
 
     # 출력 경로 변경
     if args.output:
@@ -1547,7 +2289,7 @@ if __name__ == "__main__":
         if not os.path.isdir(folder):
             print(f"오류: 폴더를 찾을 수 없습니다.\n경로: {folder}")
             sys.exit(1)
-        run(folder, output_format=args.format)
+        run(folder, output_format=args.format, workers=args.workers, zip_mode=args.zip_mode)
     else:
         # GUI 모드 (기본)
         app = DataManGUI()

@@ -6,6 +6,7 @@ __pycache__/
 
 # 백업 폴더
 _backup_*/
+_이전판/
 
 # OS
 .DS_Store
