@@ -12,7 +12,7 @@ Claude Desktop 등록 (~/Library/Application Support/Claude/claude_desktop_confi
     "dataman": {
       "command": "python3",
       "args": ["-m", "mcp_server.server"],
-      "cwd": "/Users/heojaeyeong/Library/CloudStorage/SynologyDrive-NAS/07_프로그램/5. 데이터 전처리 프로그램"
+      "cwd": "/path/to/dataman"
     }
   }
 }
